@@ -57,6 +57,27 @@ curl -X POST http://localhost:5000/convert-api \
 }
 EOF
 ```
+
+**Body Only Mode**
+To capture only the email body content without headers (Message ID, From, To, Subject), use the `bodyOnly` parameter:
+
+Using multipart-form with query parameter:
+```bash
+curl -X POST -F "eml_file=@sample.eml" "http://localhost:5000/convert?bodyOnly=true" --output output.jpeg
+```
+
+Using api endpoint with `body_only` field:
+```bash
+base64 sample.eml > encoded_file.txt
+curl -X POST http://localhost:5000/convert-api \
+-H "Content-Type: application/json" \
+-d @- <<EOF > output.jpeg
+{
+  "eml_content": "$(cat encoded_file.txt)",
+  "body_only": true
+}
+EOF
+```
 **Response**
 - On success, the service returns the rendered JPEG image as the response.
 - Metadata such as Message-ID, Subject, and From are included as HTTP response headers.
@@ -69,6 +90,7 @@ EOF
 | MAX_SCREENSHOT_HEIGHT | 15000 | Maximum height (in pixels) for generated screenshots. Prevents memory issues with very long emails. |
 | LOG_LEVEL | info | Logging verbosity level: `error`, `warn`, `info`, `debug`. |
 | LOG_FORMAT | json | Log output format: `json` (structured), `pretty` (colorized with metadata), `simple` (minimal). |
+| OFFLINE_MODE | 0 | When set to `1`, blocks all outgoing network requests during rendering (remote images, fonts, tracking pixels, etc. will not be loaded). |
 
 ## Development
 To run the application locally:
