@@ -89,6 +89,9 @@ const MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024;
 // Get maximum screenshot height to prevent massive images (in pixels)
 const MAX_SCREENSHOT_HEIGHT = parseInt(process.env.MAX_SCREENSHOT_HEIGHT || '15000', 10);
 
+// Offline mode: when enabled, block all outgoing network requests (remote images, fonts, etc.)
+const OFFLINE_MODE = process.env.OFFLINE_MODE === '1';
+
 // Multer configuration for file uploads
 const upload = multer({
     dest: 'uploads/',
@@ -122,12 +125,25 @@ function escapeHtml(unsafe) {
 }
 
 // Function to generate HTML from email content
-function generateEmailHtml(parsedEmail) {
+function generateEmailHtml(parsedEmail, options = {}) {
+    const { bodyOnly = false } = options;
     const messageId = escapeHtml(parsedEmail.messageId || 'Unknown');
     const from = parsedEmail.from?.text || 'Unknown Sender';
     const to = parsedEmail.to?.text || 'Unknown Recipient';
     const subject = parsedEmail.subject || 'No Subject';
     const htmlContent = parsedEmail.html || `<pre>${parsedEmail.text || 'No content available'}</pre>`;
+
+    const headerHtml = bodyOnly ? '' : `
+            <div class="header">
+                <div><strong>Message ID:</strong> ${messageId}</div>
+                <div><strong>From:</strong> ${from} <span class="email-address">(${parsedEmail.from?.value[0]?.address || 'Unknown'})</span></div>
+                <div><strong>To:</strong> ${to} <span class="email-address">(${parsedEmail.to?.value[0]?.address || 'Unknown'})</span></div>
+                <div><strong>Subject:</strong> ${subject}</div>
+            </div>`;
+
+    const contentStyle = bodyOnly
+        ? '.content { }'
+        : '.content { padding-top: 20px; border-top: 1px solid #ddd; margin-top: 20px; }';
 
     return `
         <html>
@@ -153,23 +169,13 @@ function generateEmailHtml(parsedEmail) {
                     border: 1px solid #ddd;
                     border-radius: 5px;
                 }
-                .header div { 
-                    margin: 5px 0; 
+                .header div {
+                    margin: 5px 0;
                 }
-                .content { 
-                    padding-top: 20px; 
-                    border-top: 1px solid #ddd; 
-                    margin-top: 20px; 
-                }
+                ${contentStyle}
             </style>
         </head>
-        <body>
-            <div class="header">
-                <div><strong>Message ID:</strong> ${messageId}</div>
-                <div><strong>From:</strong> ${from} <span class="email-address">(${parsedEmail.from?.value[0]?.address || 'Unknown'})</span></div>
-                <div><strong>To:</strong> ${to} <span class="email-address">(${parsedEmail.to?.value[0]?.address || 'Unknown'})</span></div>
-                <div><strong>Subject:</strong> ${subject}</div>
-            </div>
+        <body>${headerHtml}
             <div class="content">
                 ${htmlContent}
             </div>
@@ -190,7 +196,7 @@ function sanitizeHeaderValue(value) {
 }
 
 // Helper function to process email content
-async function processEmailContent(emailContent, res, requestMetadata = {}) {
+async function processEmailContent(emailContent, res, requestMetadata = {}, options = {}) {
     const overallTimer = createTimer();
     const stageTimings = {};
 
@@ -224,7 +230,7 @@ async function processEmailContent(emailContent, res, requestMetadata = {}) {
         const contentLength = (parsedEmail.html || parsedEmail.text || '').length;
         logger.debug('Generating HTML for rendering', { contentType, contentLength });
 
-        const emailHtml = generateEmailHtml(parsedEmail);
+        const emailHtml = generateEmailHtml(parsedEmail, options);
         stageTimings.htmlGeneration = htmlGenTimer.elapsed();
         logger.debug('HTML generated', {
             generatedHtmlLength: emailHtml.length,
@@ -239,8 +245,23 @@ async function processEmailContent(emailContent, res, requestMetadata = {}) {
         logger.debug('Setting viewport', { width: 1024, height: 0 });
         await page.setViewport({ width: 1024, height: 0 });
 
+        // In offline mode, block all outgoing network requests
+        if (OFFLINE_MODE) {
+            await page.setRequestInterception(true);
+            page.on('request', (request) => {
+                const url = request.url();
+                // Allow data URIs and inline content, block everything else
+                if (url.startsWith('data:')) {
+                    request.continue();
+                } else {
+                    logger.debug('Blocked outgoing request (offline mode)', { url });
+                    request.abort('blockedbyclient');
+                }
+            });
+        }
+
         logger.debug('Loading HTML content into page');
-        await page.setContent(emailHtml, { waitUntil: 'networkidle0', timeout: 60000 });
+        await page.setContent(emailHtml, { waitUntil: OFFLINE_MODE ? 'load' : 'networkidle0', timeout: 60000 });
 
         // Get actual page dimensions, capping width to viewport
         const dimensions = await page.evaluate(() => {
@@ -341,18 +362,20 @@ app.post('/convert', upload.single('eml_file'), async (req, res) => {
     }
 
     const inputFilePath = path.resolve(req.file.path);
+    const bodyOnly = req.query.bodyOnly === 'true';
     const requestMetadata = {
         endpoint: '/convert',
         fileName: req.file.originalname,
         fileSize: req.file.size,
-        mimeType: req.file.mimetype
+        mimeType: req.file.mimetype,
+        bodyOnly
     };
 
     logger.info('Received file upload request', requestMetadata);
 
     try {
         const emailContent = fs.createReadStream(inputFilePath);
-        await processEmailContent(emailContent, res, requestMetadata);
+        await processEmailContent(emailContent, res, requestMetadata, { bodyOnly });
     } finally {
         // Clean up uploaded file
         logger.debug('Cleaning up uploaded file', { filePath: inputFilePath });
@@ -363,15 +386,17 @@ app.post('/convert', upload.single('eml_file'), async (req, res) => {
 
 // New endpoint to handle JSON API-like requests with base64-encoded content
 app.post('/convert-api', async (req, res) => {
-    const { eml_content } = req.body;
+    const { eml_content, body_only } = req.body;
     if (!eml_content) {
         logger.warn('API request with no eml_content');
         return res.status(400).send({ error: 'No .eml content provided.' });
     }
 
+    const bodyOnly = body_only === true;
     const requestMetadata = {
         endpoint: '/convert-api',
-        encodedContentLength: eml_content.length
+        encodedContentLength: eml_content.length,
+        bodyOnly
     };
 
     logger.info('Received API request with base64 content', requestMetadata);
@@ -390,7 +415,7 @@ app.post('/convert-api', async (req, res) => {
         const emailContentStream = new stream.PassThrough();
         emailContentStream.end(decodedContent);
 
-        await processEmailContent(emailContentStream, res, requestMetadata);
+        await processEmailContent(emailContentStream, res, requestMetadata, { bodyOnly });
     } catch (err) {
         logger.error('Error decoding base64 content', {
             error: err.message,
@@ -413,6 +438,7 @@ app.listen(PORT, () => {
         port: PORT,
         maxFileSizeMB: MAX_FILE_SIZE_MB,
         maxScreenshotHeight: MAX_SCREENSHOT_HEIGHT,
+        offlineMode: OFFLINE_MODE,
         logLevel: LOG_LEVEL,
         logFormat: LOG_FORMAT,
         endpoints: ['/convert', '/convert-api', '/ping']
