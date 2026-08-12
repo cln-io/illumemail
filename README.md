@@ -8,6 +8,7 @@ Illumemail is a lightweight Node.js-based service that converts `.eml` email fil
 
 - Parse and render `.eml` files into visually accurate JPEG images.
 - Includes essential email metadata such as `Message-ID`, `From`, `To`, and `Subject` in the rendered image.
+- Optionally renders an Outlook-style attachment strip above the message body, showing each attachment's file-type icon, name, size, and declared MIME type (no file contents are previewed). Images embedded in the message body are excluded by default, so only genuine attachments are listed. Off by default; enable with `ATTACHMENT_BANNER=1` or per request with `?attachment_banner=1`.
 - Fully Dockerized for easy deployment.
 - Security-focused, running as a non-root user inside the container.
 
@@ -34,8 +35,12 @@ docker build -t illumemail .
 ```
 3. Run the Docker container:
 ```bash
-docker run -p 5000:5000 illumemail
+docker run -p 5000:5000 --shm-size=1g illumemail
 ```
+> **Note:** `--shm-size=1g` is important. Chrome stores shared memory in
+> `/dev/shm`, which Docker defaults to 64MB — too small for rendering and a
+> common cause of `Protocol error: Connection closed` crashes. The bundled
+> `docker-compose.yml` sets this for you via `shm_size`.
 
 ### Usage
 **Upload an .eml File**
@@ -70,6 +75,29 @@ EOF
 | LOG_LEVEL | info | Logging verbosity level: `error`, `warn`, `info`, `debug`. |
 | LOG_FORMAT | json | Log output format: `json` (structured), `pretty` (colorized with metadata), `simple` (minimal). |
 | OFFLINE_MODE | 0 | When set to `1`, blocks all outgoing network requests during rendering (remote images, fonts, tracking pixels, etc. will not be loaded). |
+| ATTACHMENT_BANNER | 0 | When set to `1`, renders the attachment strip above the message body. Off by default; can be overridden per request (see below). |
+| ATTACHMENT_BANNER_INLINE | 0 | When set to `1`, the banner also lists parts embedded in the HTML body (`cid:` images such as logos and signature graphics), tagged `inline`. By default only genuinely attached files are listed. |
+
+**Per-request overrides**
+
+Both attachment settings can be changed for a single request with a query parameter, which takes precedence over the environment variable. Accepted values are `1`/`true`/`yes`/`on` and `0`/`false`/`no`/`off`.
+
+| Parameter | Effect |
+| --------- | ------ |
+| `attachment_banner` | `1` renders the banner, `0` suppresses it. |
+| `attachment_banner_inline` | `1` also lists inline `cid:` parts (tagged `inline`), `0` lists only real attachments. |
+
+```bash
+# Enable the banner on an instance that has it off
+curl -X POST -F "eml_file=@sample.eml" "http://localhost:5000/convert?attachment_banner=1" --output output.jpeg
+
+# Also list the images embedded in the message body
+curl -X POST -F "eml_file=@sample.eml" "http://localhost:5000/convert?attachment_banner=1&attachment_banner_inline=1" --output output.jpeg
+```
+
+If a message carries only inline parts, no banner is rendered unless `attachment_banner_inline=1`.
+
+`/convert-api` accepts the same query parameters, and also `attachment_banner` and `attachment_banner_inline` fields in the JSON body (the query parameter wins if both are given).
 
 ## Development
 To run the application locally:
@@ -145,23 +173,21 @@ When a screenshot is truncated due to height limit, the following headers are in
 - `X-Actual-Page-Height: [pixels]` - The actual email height
 - `X-Captured-Height: [pixels]` - The maximum captured height
 
-## Docker Compose (Optional)
-Create a docker-compose.yml file to simplify deployment:
-```yaml
-version: '3.8'
-
-services:
-  illumemail:
-    image: illumemail
-    ports:
-      - "5001:5000"
-    volumes:
-      - ./uploads:/usr/src/app/uploads
-```
-Start the application:
+## Docker Compose
+A `docker-compose.yml` is included. Start the application with:
 ```bash
-docker-compose up
+docker compose up --build
 ```
+The compose file sets a few things that matter for stability:
+
+- **`shm_size: "1gb"`** — gives Chrome a large RAM-backed `/dev/shm` so
+  rendering stays fast and avoids the 64MB-default `Connection closed` crash.
+- **`healthcheck`** — runs `healthcheck.js`, which probes `/health` and reports
+  the container unhealthy when Puppeteer is down.
+- **`autoheal` sidecar** — restarts the container when it goes unhealthy. A bare
+  healthcheck only *marks* a container unhealthy; on standalone Docker/Compose
+  something has to act on it. Remove the sidecar under Swarm/Kubernetes, which
+  restart on failing health/liveness checks natively.
 
 
 ## Known Limitations
